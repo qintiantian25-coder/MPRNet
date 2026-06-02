@@ -1,0 +1,48 @@
+###############
+## MPRNet Blind Pixel Restoration Configuration
+####
+
+GPU: [0]
+
+VERBOSE: True
+
+MODEL:
+  MODE: 'BlindPixel'
+  SESSION: 'MPRNet_blind'
+  IN_C: 3
+  OUT_C: 3
+  N_FEAT: 80
+  SCALE_UNETFEATS: 48
+  SCALE_ORSNETFEATS: 32
+  NUM_CAB: 8
+  KERNEL_SIZE: 3
+  REDUCTION: 4
+  BIAS: False
+
+# Optimization arguments.
+OPTIM:
+  BATCH_SIZE: 8
+  VAL_BATCH_SIZE: 4
+  NUM_EPOCHS: 3000
+  WARMUP_EPOCHS: 3
+  LR_INITIAL: 2e-4
+  LR_MIN: 1e-6
+
+TRAINING:
+  VAL_AFTER_EVERY: 20
+  RESUME: False
+  TRAIN_PS: 128
+  VAL_PS: 128
+  DATA_ROOT: '/home/student_server/Qtt/NAFNet/data_new'
+  SAVE_DIR: './experiments'
+  NUM_WORKERS: 8
+  NUM_WORKERS_VAL: 4
+  USE_MASK_WEIGHT: False
+  MASK_BLIND_WEIGHT: 5.0
+  EDGE_LOSS_WEIGHT: 0.05
+  # SAVE_IMAGES: False
+
+TEST:
+  CHECKPOINT: './experiments/models/best_model.pt'
+  SAVE_DIR: './results'
+  IMAGE_BORDER: 0
