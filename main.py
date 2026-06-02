@@ -165,7 +165,6 @@ def train(config_path):
 
     best_psnr = 0
     best_epoch = 0
-    scaler = torch.amp.GradScaler('cuda')
 
     for epoch in range(start_epoch, opt.OPTIM.NUM_EPOCHS + 1):
         epoch_start_time = time.time()
@@ -179,17 +178,17 @@ def train(config_path):
             target = data[0].cuda()
             input_ = data[1].cuda()
 
-            with torch.amp.autocast('cuda'):
-                restored = model_restoration(input_)
-                loss_char = torch.sum(torch.stack(
-                    [criterion_char(restored[j], target) for j in range(len(restored))]))
-                loss_edge = torch.sum(torch.stack(
-                    [criterion_edge(restored[j], target) for j in range(len(restored))]))
-                loss = loss_char + edge_loss_weight * loss_edge
+            restored = model_restoration(input_)
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            loss_char = torch.sum(torch.stack(
+                [criterion_char(restored[j], target) for j in range(len(restored))]))
+            loss_edge = torch.sum(torch.stack(
+                [criterion_edge(restored[j], target) for j in range(len(restored))]))
+            loss = loss_char + edge_loss_weight * loss_edge
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model_restoration.parameters(), max_norm=1.0)
+            optimizer.step()
             epoch_loss += loss.item()
 
         epoch_time = time.time() - epoch_start_time
