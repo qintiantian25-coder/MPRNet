@@ -1,4 +1,15 @@
 .ipynb_checkpoints/
 *.pyc
 .DS_Store
+__pycache__/
+
+# Training outputs
+experiments/
+
+# Test outputs
+results/
+
+# IDE
+.vscode/
+.idea/
 
