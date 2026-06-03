@@ -175,8 +175,14 @@ results/
 ├── test/                     # Restored images (replicates test_blur/ structure)
 ├── triple_comparison/        # Input|Output|GT concatenated for visual inspection
 └── blind_eval/
-    ├── test_blind_metrics.csv           # Per-image metrics
-    └── test_blind_summary_by_seq.csv    # Per-group summary
+    ├── test_blind_metrics.csv           # Global per-image metrics
+    ├── test_blind_summary_by_seq.csv    # Global per-group summary
+    ├── 001/
+    │   ├── test_blind_metrics_001.csv   # Group 001 per-image metrics
+    │   └── test_blind_summary_001.csv   # Group 001 summary
+    ├── 002/
+    │   └── ...
+    └── ...
 ```
 
 ## License

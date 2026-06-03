@@ -187,7 +187,7 @@ def train(config_path):
             loss = loss_char + edge_loss_weight * loss_edge
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model_restoration.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model_restoration.parameters(), max_norm=0.5)
             optimizer.step()
             epoch_loss += loss.item()
 
@@ -291,7 +291,7 @@ def test(config_path):
     model.cuda()
     model.eval()
 
-    # Collect GT mapping
+    # Collect GT mapping (relative path → absolute path)
     gt_root = os.path.join(data_root, 'test_sharp')
     gt_rel_map = {}
     for root, _, files in os.walk(gt_root):
@@ -305,7 +305,6 @@ def test(config_path):
     input_root = os.path.join(data_root, 'test_blur')
     input_rel_map = {}
     grouped_files = defaultdict(list)
-    all_files = []
 
     for root, _, files in os.walk(input_root):
         for f in sorted(files, key=natural_sort_key):
@@ -315,7 +314,6 @@ def test(config_path):
                 input_rel_map[rel] = p
                 group_name = rel.split('/')[0] if '/' in rel else ''
                 grouped_files[group_name].append((p, rel, f))
-                all_files.append((p, rel, f, group_name))
 
     mask_root = os.path.join(data_root, 'test_mask')
     report = TestReport(crop_border=image_border)
@@ -325,109 +323,147 @@ def test(config_path):
     total_seq_logs = {}
     total_seq_stats = {}
 
-    current_group = None
+    keys = [
+        'image', 'seq', 'psnr', 'ssim',
+        'blind_mae', 'blind_rmse', 'blind_psnr',
+        'blind_mae_input', 'blind_mae_gain_abs', 'blind_mae_gain_pct', 'blind_count'
+    ]
+    summary_keys = [
+        'seq', 'images', 'blind_count',
+        'blind_mae', 'blind_rmse', 'blind_psnr',
+        'input_blind_mae', 'input_blind_psnr',
+        'blind_mae_gain_abs', 'blind_mae_gain_pct'
+    ]
 
-    print(f"===> Starting inference on {len(all_files)} test images...")
+    # Helper: write per-group CSV after the group's images are done
+    def write_group_csv(seq_name, seq_logs, seq_stats_dict):
+        seq_label = seq_name if seq_name else 'root'
+        save_blind_dir = os.path.join(save_dir, 'blind_eval', seq_label)
+        os.makedirs(save_blind_dir, exist_ok=True)
+
+        if len(seq_logs) > 0:
+            seq_csv = os.path.join(save_blind_dir, f'test_blind_metrics_{seq_label}.csv')
+            with open(seq_csv, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=keys)
+                writer.writeheader()
+                for row in seq_logs:
+                    writer.writerow(row)
+            print(f"  → {seq_label}/test_blind_metrics_{seq_label}.csv")
+
+        st = seq_stats_dict
+        pix = int(st.get('blind_pix_sum', 0))
+        if pix > 0:
+            summary_row = {
+                'seq': seq_label, 'images': len(seq_logs), 'blind_count': pix,
+                'blind_mae': float(st['blind_abs_sum'] / pix),
+                'blind_rmse': float(np.sqrt(st['blind_sq_sum'] / pix)),
+                'blind_psnr': float(10.0 * np.log10((255.0 * 255.0) / max(st['blind_sq_sum'] / pix, 1e-12))),
+                'input_blind_mae': None, 'input_blind_psnr': None,
+                'blind_mae_gain_abs': None, 'blind_mae_gain_pct': None,
+            }
+            if st['blind_abs_in_sum'] > 0:
+                in_mae = st['blind_abs_in_sum'] / pix
+                in_mse = st['blind_sq_in_sum'] / pix
+                summary_row['input_blind_mae'] = float(in_mae)
+                summary_row['input_blind_psnr'] = float(10.0 * np.log10((255.0 * 255.0) / max(in_mse, 1e-12)))
+                summary_row['blind_mae_gain_abs'] = float(in_mae - summary_row['blind_mae'])
+                summary_row['blind_mae_gain_pct'] = float(100.0 * summary_row['blind_mae_gain_abs'] / (in_mae + 1e-12))
+            seq_summary_csv = os.path.join(save_blind_dir, f'test_blind_summary_{seq_label}.csv')
+            with open(seq_summary_csv, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=summary_keys)
+                writer.writeheader()
+                writer.writerow(summary_row)
+
+    all_count = sum(len(v) for v in grouped_files.values())
+    print(f"===> Starting inference on {all_count} test images in {len(grouped_files)} groups...")
 
     with torch.no_grad():
-        for idx, (inp_path, rel_path, fname, group_name) in enumerate(tqdm(all_files)):
-            # Determine group for mask loading
-            if current_group is None:
-                current_group = group_name
-            elif group_name != current_group:
-                current_group = group_name
+        for seq_name in sorted(grouped_files.keys(), key=natural_sort_key):
+            group_files = grouped_files[seq_name]
+            seq_logs = []
+            seq_stats = {'blind_abs_sum': 0.0, 'blind_sq_sum': 0.0,
+                         'blind_abs_in_sum': 0.0, 'blind_sq_in_sum': 0.0,
+                         'blind_pix_sum': 0}
+            print(f"\n===> 处理子文件夹: {seq_name} ({len(group_files)} 张)")
 
-            # Load and preprocess input (RGB, matching model's 3-channel input)
-            inp_img = Image.open(inp_path).convert('RGB')
-            inp_tensor = TF.to_tensor(inp_img).unsqueeze(0).cuda()
+            for inp_path, rel_path, fname in tqdm(group_files, desc=f'  {seq_name}'):
+                # Load and preprocess input
+                inp_img = Image.open(inp_path).convert('RGB')
+                inp_tensor = TF.to_tensor(inp_img).unsqueeze(0).cuda()
 
-            # Pad to multiple of 8
-            h, w = inp_tensor.shape[2], inp_tensor.shape[3]
-            H = ((h + img_multiple_of) // img_multiple_of) * img_multiple_of
-            W = ((w + img_multiple_of) // img_multiple_of) * img_multiple_of
-            padh = H - h if h % img_multiple_of != 0 else 0
-            padw = W - w if w % img_multiple_of != 0 else 0
-            if padh > 0 or padw > 0:
-                inp_tensor = F.pad(inp_tensor, (0, padw, 0, padh), 'reflect')
+                # Pad to multiple of 8
+                h, w = inp_tensor.shape[2], inp_tensor.shape[3]
+                H = ((h + img_multiple_of) // img_multiple_of) * img_multiple_of
+                W = ((w + img_multiple_of) // img_multiple_of) * img_multiple_of
+                padh = H - h if h % img_multiple_of != 0 else 0
+                padw = W - w if w % img_multiple_of != 0 else 0
+                if padh > 0 or padw > 0:
+                    inp_tensor = F.pad(inp_tensor, (0, padw, 0, padh), 'reflect')
 
-            output = model(inp_tensor)
-            output = output[0]  # final stage
-            output = torch.clamp(output, 0, 1)
-            output = output[:, :, :h, :w]  # unpad
-            if inp_tensor.shape[2] != h or inp_tensor.shape[3] != w:
-                inp_tensor_display = inp_tensor[:, :, :h, :w]
-            else:
-                inp_tensor_display = inp_tensor
+                output = model(inp_tensor)
+                output = output[0]
+                output = torch.clamp(output, 0, 1)
+                output = output[:, :, :h, :w]
+                inp_display = inp_tensor[:, :, :h, :w] if (padh > 0 or padw > 0) else inp_tensor
 
-            # Model outputs 3-channel (R=G=B since grayscale input was replicated).
-            # Take first channel for saving as grayscale.
-            out_np = (output[0, 0].cpu().numpy() * 255).round().clip(0, 255).astype(np.uint8)
+                # Take first channel for grayscale save
+                out_np = (output[0, 0].cpu().numpy() * 255).round().clip(0, 255).astype(np.uint8)
 
-            # Save pure output
-            pure_dir = os.path.join(save_pure, os.path.dirname(rel_path)) if os.path.dirname(rel_path) else save_pure
-            os.makedirs(pure_dir, exist_ok=True)
-            cv2.imwrite(os.path.join(pure_dir, fname), out_np)
+                # Save pure output
+                pure_dir = os.path.join(save_pure, os.path.dirname(rel_path)) if os.path.dirname(rel_path) else save_pure
+                os.makedirs(pure_dir, exist_ok=True)
+                cv2.imwrite(os.path.join(pure_dir, fname), out_np)
 
-            # Load GT and compute metrics
-            gt_path = gt_rel_map.get(rel_path)
-            if gt_path is None:
-                # Fallback: search by filename
-                for k, v in gt_rel_map.items():
-                    if os.path.basename(k) == fname:
-                        gt_path = v
-                        break
+                # Load GT
+                gt_path = gt_rel_map.get(rel_path)
+                if gt_path is None:
+                    for k, v in gt_rel_map.items():
+                        if os.path.basename(k) == fname:
+                            gt_path = v
+                            break
 
-            if gt_path and os.path.exists(gt_path):
+                if not (gt_path and os.path.exists(gt_path)):
+                    continue
+
                 gt_img = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)
                 if gt_img is None:
                     continue
 
                 gt_tensor = torch.from_numpy(gt_img).float() / 255.0
-                gt_tensor = gt_tensor.unsqueeze(0).unsqueeze(0).cuda()  # (1,1,H,W)
-                # Replicate GT to 3 channels for comparison with model output
-                gt_tensor_3ch = gt_tensor.repeat(1, 3, 1, 1)  # (1,3,H,W)
+                gt_tensor = gt_tensor.unsqueeze(0).unsqueeze(0).cuda()
+                gt_tensor_3ch = gt_tensor.repeat(1, 3, 1, 1)
 
-                output_resized = output  # (1,3,H,W)
-                inp_display = inp_tensor_display  # (1,3,H,W)
-
+                # Save triple comparison
+                output_resized = output
                 if output_resized.shape[2:] != gt_tensor.shape[2:]:
                     output_resized = F.interpolate(output_resized, size=(gt_tensor.shape[2], gt_tensor.shape[3]),
                                                    mode='bilinear')
-                if inp_display.shape[2:] != gt_tensor.shape[2:]:
                     inp_display = F.interpolate(inp_display, size=(gt_tensor.shape[2], gt_tensor.shape[3]),
                                                 mode='bilinear')
-
-                # Save triple comparison: [input | output | gt]
                 comparison = torch.cat([inp_display, output_resized, gt_tensor_3ch], dim=3)
                 import torchvision
                 triple_dir = os.path.join(save_triple, os.path.dirname(rel_path)) if os.path.dirname(rel_path) else save_triple
                 os.makedirs(triple_dir, exist_ok=True)
                 torchvision.utils.save_image(comparison, os.path.join(triple_dir, f"triple_{fname}"))
 
-                # Full-image PSNR/SSIM
+                # Full-image metrics
                 report.update_metric(gt_img, out_np, rel_path)
                 full_psnr = float(report.total_rgb_psnr[-1])
                 full_ssim = float(report.total_ssim[-1])
 
-                # Blind pixel metrics
                 row = {
-                    'image': rel_path,
-                    'seq': group_name,
-                    'psnr': full_psnr,
-                    'ssim': full_ssim,
-                    'blind_mae': None,
-                    'blind_rmse': None,
-                    'blind_psnr': None,
-                    'blind_mae_input': None,
-                    'blind_mae_gain_abs': None,
-                    'blind_mae_gain_pct': None,
+                    'image': rel_path, 'seq': seq_name,
+                    'psnr': full_psnr, 'ssim': full_ssim,
+                    'blind_mae': None, 'blind_rmse': None, 'blind_psnr': None,
+                    'blind_mae_input': None, 'blind_mae_gain_abs': None, 'blind_mae_gain_pct': None,
                     'blind_count': 0,
                 }
 
+                # Blind pixel metrics
                 merged_coords = []
                 h_img, w_img = gt_img.shape[:2]
-                blind_csv = os.path.join(mask_root, group_name, 'blind_pixel_coords.csv')
-                flash_csv = os.path.join(mask_root, group_name, 'flash_pixel_coords.csv')
+                blind_csv = os.path.join(mask_root, seq_name, 'blind_pixel_coords.csv')
+                flash_csv = os.path.join(mask_root, seq_name, 'flash_pixel_coords.csv')
 
                 blind_coords = load_blind_coords(blind_csv)
                 flash_map = load_flash_map(flash_csv)
@@ -457,19 +493,12 @@ def test(config_path):
                         blind_sq_sum = float((err ** 2).sum())
                         blind_count = int(len(err))
 
-                        total_seq_stats.setdefault(group_name, {
-                            'blind_abs_sum': 0.0, 'blind_sq_sum': 0.0,
-                            'blind_abs_in_sum': 0.0, 'blind_sq_in_sum': 0.0,
-                            'blind_pix_sum': 0,
-                        })
-                        st = total_seq_stats[group_name]
-                        st['blind_abs_sum'] += blind_abs_sum
-                        st['blind_sq_sum'] += blind_sq_sum
-                        st['blind_pix_sum'] += blind_count
+                        seq_stats['blind_abs_sum'] += blind_abs_sum
+                        seq_stats['blind_sq_sum'] += blind_sq_sum
+                        seq_stats['blind_pix_sum'] += blind_count
 
-                        # Input image blind metrics
-                        in_path = input_rel_map.get(rel_path)
                         in_mae = None
+                        in_path = input_rel_map.get(rel_path)
                         if in_path and os.path.exists(in_path):
                             in_img = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
                             if in_img is not None:
@@ -477,10 +506,8 @@ def test(config_path):
                                     in_img = cv2.resize(in_img, (gt_img.shape[1], gt_img.shape[0]))
                                 in_vals = in_img[y, x].astype(np.float64)
                                 in_err = in_vals - gt_vals
-                                in_abs_sum = float(np.abs(in_err).sum())
-                                in_sq_sum = float((in_err ** 2).sum())
-                                st['blind_abs_in_sum'] += in_abs_sum
-                                st['blind_sq_in_sum'] += in_sq_sum
+                                seq_stats['blind_abs_in_sum'] += float(np.abs(in_err).sum())
+                                seq_stats['blind_sq_in_sum'] += float((in_err ** 2).sum())
                                 in_mae = float(np.abs(in_err).mean())
 
                         row.update({
@@ -494,19 +521,20 @@ def test(config_path):
                             row['blind_mae_gain_abs'] = in_mae - row['blind_mae']
                             row['blind_mae_gain_pct'] = 100.0 * row['blind_mae_gain_abs'] / (in_mae + 1e-12)
 
+                seq_logs.append(row)
                 total_per_image_logs.append(row)
-                total_seq_logs.setdefault(group_name, []).append(row)
 
+            # After group finished, write per-group CSV
+            total_seq_logs[seq_name] = seq_logs
+            total_seq_stats[seq_name] = seq_stats
+            print(f"===> 子文件夹 {seq_name} 推理完成，开始生成 CSV...")
+            write_group_csv(seq_name, seq_logs, seq_stats)
+
+    # ---------- Final global report ----------
     report.print_final_result()
 
-    # Save per-image CSV
     save_blind_dir = os.path.join(save_dir, 'blind_eval')
     os.makedirs(save_blind_dir, exist_ok=True)
-    keys = [
-        'image', 'seq', 'psnr', 'ssim',
-        'blind_mae', 'blind_rmse', 'blind_psnr',
-        'blind_mae_input', 'blind_mae_gain_abs', 'blind_mae_gain_pct', 'blind_count'
-    ]
 
     if len(total_per_image_logs) > 0:
         per_img_csv = os.path.join(save_blind_dir, 'test_blind_metrics.csv')
@@ -515,15 +543,8 @@ def test(config_path):
             writer.writeheader()
             for row in total_per_image_logs:
                 writer.writerow(row)
-        print(f"Per-image test metrics saved to: {per_img_csv}")
+        print(f"\nPer-image test metrics saved to: {per_img_csv}")
 
-        # Save per-group summary CSV
-        summary_keys = [
-            'seq', 'images', 'blind_count',
-            'blind_mae', 'blind_rmse', 'blind_psnr',
-            'input_blind_mae', 'input_blind_psnr',
-            'blind_mae_gain_abs', 'blind_mae_gain_pct'
-        ]
         summary_csv = os.path.join(save_blind_dir, 'test_blind_summary_by_seq.csv')
         with open(summary_csv, 'w', encoding='utf-8', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=summary_keys)
@@ -532,16 +553,11 @@ def test(config_path):
                 st = total_seq_stats.get(seq_name, {})
                 pix = int(st.get('blind_pix_sum', 0))
                 row = {
-                    'seq': seq_name,
-                    'images': len(total_seq_logs.get(seq_name, [])),
+                    'seq': seq_name, 'images': len(total_seq_logs.get(seq_name, [])),
                     'blind_count': pix,
-                    'blind_mae': None,
-                    'blind_rmse': None,
-                    'blind_psnr': None,
-                    'input_blind_mae': None,
-                    'input_blind_psnr': None,
-                    'blind_mae_gain_abs': None,
-                    'blind_mae_gain_pct': None,
+                    'blind_mae': None, 'blind_rmse': None, 'blind_psnr': None,
+                    'input_blind_mae': None, 'input_blind_psnr': None,
+                    'blind_mae_gain_abs': None, 'blind_mae_gain_pct': None,
                 }
                 if pix > 0:
                     mae = st['blind_abs_sum'] / pix
@@ -559,7 +575,7 @@ def test(config_path):
                 writer.writerow(row)
         print(f"Per-seq summary saved to: {summary_csv}")
 
-    # Print global blind stats
+    # Global blind stats
     total_blind_abs_sum = sum(s['blind_abs_sum'] for s in total_seq_stats.values())
     total_blind_sq_sum = sum(s['blind_sq_sum'] for s in total_seq_stats.values())
     total_blind_pix_sum = sum(s['blind_pix_sum'] for s in total_seq_stats.values())
